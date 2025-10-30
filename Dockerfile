@@ -1,10 +1,10 @@
-FROM golang:1.21-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /go/src/github.com/guillembonet/pi-metrics
 ADD . .
 RUN go build -o build/pi-metrics .
 
-FROM alpine:3.18
+FROM alpine:3.22
 
 RUN apk update && apk upgrade
 

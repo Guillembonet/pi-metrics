@@ -1,120 +1,122 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/rs/zerolog/log"
 )
-
-var (
-	temperatureGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "pi_temperature",
-			Help: "The current temperature of the Raspberry Pi in degrees Celsius.",
-		},
-		[]string{"name"},
-	)
-
-	tempFile    string
-	metricsPath string
-	name        string
-	interval    time.Duration
-)
-
-func init() {
-	// Register metrics with Prometheus
-	prometheus.MustRegister(temperatureGauge)
-}
 
 func main() {
-	metricsPath = "/metrics"
-	val, ok := os.LookupEnv("METRICS_PATH")
-	if ok {
-		metricsPath = "/" + strings.TrimPrefix(val, "/")
-	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
 
-	name = ""
-	val, ok = os.LookupEnv("NAME")
-	if ok {
+	name := ""
+	val := os.Getenv("NAME")
+	if val != "" {
 		name = val
 	}
 
-	tempFile = "sys/class/thermal/thermal_zone0/temp"
-	val, ok = os.LookupEnv("TEMP_FILE")
-	if ok {
+	tempFile := "sys/class/thermal/thermal_zone0/temp"
+	val = os.Getenv("TEMP_FILE")
+	if val != "" {
 		tempFile = val
 	}
 
-	interval = 10 * time.Second
-	val, ok = os.LookupEnv("INTERVAL")
-	if ok {
-		var err error
-		interval, err = time.ParseDuration(val)
-		if err != nil {
-			log.Fatal().Err(err).Msg("error parsing interval")
-		}
+	address := ":8080"
+	val = os.Getenv("ADDRESS")
+	if val != "" {
+		address = val
 	}
 
-	debugMode := false
-	val, ok = os.LookupEnv("DEBUG")
-	if ok && val == "true" {
-		debugMode = true
+	registry := prometheus.NewRegistry()
+	registry.Register(NewTempCollector(name, tempFile))
+
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	mux.Handle("GET /health", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	server := &http.Server{
+		Addr:    address,
+		Handler: mux,
 	}
-	if debugMode {
-		gin.SetMode(gin.DebugMode)
-	} else {
-		gin.SetMode(gin.ReleaseMode)
-	}
-
-	port := ":8080"
-	val, ok = os.LookupEnv("PORT")
-	if ok {
-		port = ":" + strings.TrimPrefix(val, ":")
-	}
-
-	router := gin.Default()
-	router.GET(metricsPath, gin.WrapH(promhttp.Handler()))
-
-	start(interval)
-
-	log.Debug().Str("port", port).Msg("Starting server")
-	err := router.Run(port)
-	if err != nil {
-		log.Fatal().Err(err).Msg("error starting server")
-	}
-}
-
-func start(interval time.Duration) {
-	log.Info().Str("interval", interval.String()).Msg("Starting temperature monitor")
-	ticker := time.NewTicker(interval)
 	go func() {
-		for range ticker.C {
-			updateTemperature()
+		err := server.ListenAndServe()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("failed to serve", slog.String("error", err.Error()))
+			os.Exit(1)
 		}
 	}()
+
+	<-ctx.Done()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		slog.Error("failed to shutdown server", slog.String("error", err.Error()))
+	}
+
+	slog.Info("stopped gracefully")
 }
 
-func updateTemperature() {
+type TempCollector struct {
+	name, tempFile string
+	desc           *prometheus.Desc
+}
+
+func NewTempCollector(name, tempFile string) *TempCollector {
+	return &TempCollector{
+		name:     name,
+		tempFile: tempFile,
+		desc: prometheus.NewDesc("pi_temperature",
+			"The current temperature of the Raspberry Pi in degrees Celsius.",
+			nil, prometheus.Labels{"name": name},
+		),
+	}
+}
+
+func (t *TempCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- t.desc
+}
+
+func (t *TempCollector) Collect(ch chan<- prometheus.Metric) {
+	temp, err := getTemperature(t.tempFile)
+	if err != nil {
+		slog.Error("failed to get temperature", slog.String("error", err.Error()))
+		return
+	}
+
+	metric, err := prometheus.NewConstMetric(t.desc, prometheus.GaugeValue, temp)
+	if err != nil {
+		slog.Error("failed to create metric", slog.String("error", err.Error()))
+		return
+	}
+
+	ch <- metric
+}
+
+func getTemperature(tempFile string) (float64, error) {
 	tempData, err := os.ReadFile(tempFile)
 	if err != nil {
-		log.Error().Err(err).Msg("error reading temperature file")
-		return
+		return 0, fmt.Errorf("read temperature file (%s): %w", tempFile, err)
 	}
 
-	tempString := strings.TrimSuffix(string(tempData), "\n")
-	tempInt, err := strconv.Atoi(tempString)
+	tempInt, err := strconv.Atoi(strings.TrimSpace(string(tempData)))
 	if err != nil {
-		log.Error().Err(err).Msg("error converting temperature to int")
-		return
+		return 0, fmt.Errorf("convert temperature to int: %w", err)
 	}
 
-	temp := float64(tempInt) / 1000.0
-	log.Debug().Float64("temp", temp).Msg("Updating temperature")
-	temperatureGauge.WithLabelValues(name).Set(temp)
+	return float64(tempInt) / 1000.0, nil
 }
